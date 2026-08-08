@@ -1,5 +1,6 @@
 import importlib.util
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -35,6 +36,26 @@ class PrivateKeyResolutionTests(unittest.TestCase):
         signer.DEFAULT_PRIVATE_KEYS["polygon"] = "0x" + "33" * 32
         resolved = signer.resolve_private_key("polygon")
         self.assertEqual(resolved, bytes.fromhex("33" * 32))
+
+    def test_json_config_fallback(self) -> None:
+        prior_path = signer.DEFAULT_KEY_CONFIG_PATH
+        prior_eth = os.environ.pop("ETH_PRIVATE_KEY", None)
+        prior_private = os.environ.pop("PRIVATE_KEY", None)
+
+        try:
+            with tempfile.TemporaryDirectory() as tmpdir:
+                config_path = Path(tmpdir) / "offline_signer.json"
+                config_path.write_text(json.dumps({"ethereum": "0x" + "44" * 32}), encoding="utf-8")
+                signer.DEFAULT_KEY_CONFIG_PATH = config_path
+
+                resolved = signer.resolve_private_key("ethereum")
+                self.assertEqual(resolved, bytes.fromhex("44" * 32))
+        finally:
+            signer.DEFAULT_KEY_CONFIG_PATH = prior_path
+            if prior_eth is not None:
+                os.environ["ETH_PRIVATE_KEY"] = prior_eth
+            if prior_private is not None:
+                os.environ["PRIVATE_KEY"] = prior_private
 
 
 class SigningExecutionTests(unittest.TestCase):

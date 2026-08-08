@@ -52,6 +52,26 @@ DEFAULT_PRIVATE_KEYS: dict[str, str] = {
     "default":   os.environ.get("DEFAULT_PRIVATE_KEY", ""),
 }
 
+DEFAULT_KEY_CONFIG_PATH = Path.home() / ".offline_signer.json"
+
+
+def load_key_config(path: Path | None = None) -> dict[str, str]:
+    """Load an optional JSON key config file for manually editable private keys."""
+    path = path or DEFAULT_KEY_CONFIG_PATH
+    if not path.exists():
+        return {}
+
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, json.JSONDecodeError) as exc:
+        raise RuntimeError(f"Unable to load key configuration from {path}: {exc}") from exc
+
+    if not isinstance(data, dict):
+        raise ValueError(f"Key configuration file {path} must contain a JSON object.")
+
+    return {k: str(v) for k, v in data.items() if isinstance(k, str) and v is not None}
+
 # ---------------------------------------------------------------------------
 # Key Normalization & Resolution
 # ---------------------------------------------------------------------------
@@ -76,17 +96,21 @@ def resolve_private_key(chain_key: str, cli_key: str | None = None) -> bytes:
     """
     Resolve private key in priority order:
     1. Explicit CLI argument (`--key`)
-    2. Environment variable (`<CHAIN>_PRIVATE_KEY` / `PRIVATE_KEY`)
-    3. `DEFAULT_PRIVATE_KEYS[chain_key]` entry
-    4. `DEFAULT_PRIVATE_KEYS["default"]` fallback
-    5. Interactive getpass prompt
+    2. JSON config file (`~/.offline_signer.json`)
+    3. Environment variable (`<CHAIN>_PRIVATE_KEY` / `PRIVATE_KEY`)
+    4. `DEFAULT_PRIVATE_KEYS[chain_key]` entry
+    5. `DEFAULT_PRIVATE_KEYS["default"]` fallback
+    6. Interactive getpass prompt
     """
     if cli_key:
         return normalize_private_key(cli_key)
 
+    config = load_key_config()
     env_var_name = f"{chain_key.upper()}_PRIVATE_KEY"
     key_str = (
-        os.environ.get(env_var_name)
+        config.get(chain_key)
+        or config.get("default")
+        or os.environ.get(env_var_name)
         or os.environ.get("PRIVATE_KEY")
         or DEFAULT_PRIVATE_KEYS.get(chain_key, "")
         or DEFAULT_PRIVATE_KEYS.get("default", "")

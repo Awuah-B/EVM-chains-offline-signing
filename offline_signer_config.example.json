@@ -1,0 +1,11 @@
+{
+  "ethereum": "0xYOUR_ETH_PRIVATE_KEY",
+  "bsc": "0xYOUR_BSC_PRIVATE_KEY",
+  "polygon": "0xYOUR_POLYGON_PRIVATE_KEY",
+  "arbitrum": "0xYOUR_ARBITRUM_PRIVATE_KEY",
+  "optimism": "0xYOUR_OPTIMISM_PRIVATE_KEY",
+  "base": "0xYOUR_BASE_PRIVATE_KEY",
+  "avalanche": "0xYOUR_AVALANCHE_PRIVATE_KEY",
+  "dogecoin": "0xYOUR_DOGECOIN_PRIVATE_KEY",
+  "default": "0xYOUR_DEFAULT_PRIVATE_KEY"
+}
