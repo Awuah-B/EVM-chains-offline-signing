@@ -1,172 +1,117 @@
 #!/usr/bin/env python3
 """
-signer.py — Offline EVM Transaction Signer
-============================================
-Designed to run on a completely AIR-GAPPED machine.
+signer.py — Multi-Chain Offline Transaction Signer (EVM + Dogecoin)
+===================================================================
+Designed to run on an amnesia air-gapped machine (Tails / ephemeral RAM OS).
 
 Workflow:
-  1. Copy the unsigned_tx.json from the online machine (USB / QR / SD card)
+  1. Copy unsigned_tx.json from online machine (USB / SD card)
   2. Run:  python signer.py unsigned_tx.json
-  3. Review every TX field carefully before confirming
-  4. Enter your private key when prompted (hidden input, never logged)
-  5. The signed_tx.json is written to disk
-  6. Copy signed_tx.json back to the online machine for broadcast
-
-Security contract:
-  • No network calls are made — ever.
-  • Private key is read via getpass (not echoed to terminal).
-  • Key bytes are overwritten in memory immediately after signing.
-  • The signed output contains ONLY the raw signed hex — no key material.
+  3. Pre-configured per-chain default private keys automatically sign transactions
+  4. The signed_tx.json is written to disk
+  5. Copy signed_tx.json back to online machine for broadcast
 """
 
 from __future__ import annotations
 
 import argparse
-import ctypes
+import hashlib
 import json
 import os
 import re
+import struct
 import sys
 from datetime import datetime, timezone
-from decimal import Decimal
 from getpass import getpass
 from pathlib import Path
 from typing import Any
 
 try:
-    from colorama import Fore, Style, init as colorama_init
-except ImportError:  # pragma: no cover - exercised in minimal offline environments
-    class _ColorFallback:
-        BLACK = ""
-        RED = ""
-        GREEN = ""
-        YELLOW = ""
-        BLUE = ""
-        CYAN = ""
-        WHITE = ""
-        DIM = ""
-        BRIGHT = ""
-        RESET_ALL = ""
-
-    Fore = _ColorFallback()
-    Style = _ColorFallback()
-
-    def colorama_init(*_args: Any, **_kwargs: Any) -> None:
-        return None
+    from eth_account import Account
+except ImportError:
+    Account = None
 
 try:
-    from eth_account import Account
-    from eth_account.signers.local import LocalAccount
-except ImportError:  # pragma: no cover - exercised when wheelhouse is not installed yet
-    Account = None
-    LocalAccount = Any
-
-colorama_init(autoreset=True)
+    from eth_keys import keys as eth_keys
+except ImportError:
+    eth_keys = None
 
 # ---------------------------------------------------------------------------
-# Schema constants
+# Default Private Keys per Chain
+# Pre-configure keys here or export environment variables for amnesia systems.
 # ---------------------------------------------------------------------------
-UNSIGNED_SCHEMA = "evm-unsigned-tx/v1"
-SIGNED_SCHEMA   = "evm-signed-tx/v1"
-
-# ---------------------------------------------------------------------------
-# Terminal helpers (self-contained — no dependency on online utils.py)
-# ---------------------------------------------------------------------------
-
-W = 64  # banner width
-
-
-def _c(text: str, colour: str, bold: bool = False) -> str:
-    b = Style.BRIGHT if bold else ""
-    return f"{colour}{b}{text}{Style.RESET_ALL}"
-
-
-def banner() -> None:
-    print()
-    print(_c("─" * W, Fore.CYAN, bold=True))
-    print(_c("  OFFLINE EVM TRANSACTION SIGNER", Fore.CYAN, bold=True))
-    print(_c("  Air-Gap Ready  ·  No Network Required", Fore.WHITE))
-    print(_c("─" * W, Fore.CYAN, bold=True))
-    print()
-
-
-def header(text: str) -> None:
-    print()
-    print(_c(f"  ── {text} ", Fore.CYAN, bold=True))
-
-
-def ok(text: str) -> None:
-    print(_c("✔  ", Fore.GREEN, bold=True) + text)
-
-
-def err(text: str) -> None:
-    print(_c("✘  ", Fore.RED, bold=True) + text)
-
-
-def warn(text: str) -> None:
-    print(_c("⚠  ", Fore.YELLOW, bold=True) + text)
-
-
-def info(text: str) -> None:
-    print(_c("ℹ  ", Fore.BLUE) + text)
-
-
-def field(label: str, value: str, indent: int = 4, alert: bool = False) -> None:
-    colour = Fore.YELLOW if alert else Fore.CYAN
-    pad = " " * indent
-    print(f"{pad}{_c(f'{label:<26}', colour)}{value}")
-
-
-def sep() -> None:
-    print(_c("─" * W, Fore.WHITE + Style.DIM))
-
+DEFAULT_PRIVATE_KEYS: dict[str, str] = {
+    "ethereum":  os.environ.get("ETH_PRIVATE_KEY", ""),
+    "bsc":       os.environ.get("BSC_PRIVATE_KEY", ""),
+    "polygon":   os.environ.get("POLYGON_PRIVATE_KEY", ""),
+    "arbitrum":  os.environ.get("ARBITRUM_PRIVATE_KEY", ""),
+    "optimism":  os.environ.get("OPTIMISM_PRIVATE_KEY", ""),
+    "base":      os.environ.get("BASE_PRIVATE_KEY", ""),
+    "avalanche": os.environ.get("AVALANCHE_PRIVATE_KEY", ""),
+    "dogecoin":  os.environ.get("DOGECOIN_PRIVATE_KEY", ""),
+    "default":   os.environ.get("DEFAULT_PRIVATE_KEY", ""),
+}
 
 # ---------------------------------------------------------------------------
-# Load & validate unsigned TX
+# Key Normalization & Resolution
 # ---------------------------------------------------------------------------
 
-def load_unsigned_tx(filepath: str) -> tuple[dict, dict]:
-    """
-    Load and validate an unsigned TX JSON file.
-
-    Returns:
-        (payload, tx_dict)  — the full JSON payload and the core tx fields.
-    Raises:
-        SystemExit on any validation failure.
-    """
-    path = Path(filepath).expanduser().resolve()
-    if not path.exists():
-        err(f"File not found: {path}")
-        sys.exit(1)
-
+def normalize_private_key(raw: str) -> bytes:
+    """Normalize a private key hex string into 32 raw bytes."""
+    if not raw:
+        raise ValueError("Private key is empty.")
+    stripped = raw[2:] if raw.startswith(("0x", "0X")) else raw
+    if not re.fullmatch(r"[0-9a-fA-F]+", stripped):
+        raise ValueError("Private key must contain only hexadecimal characters.")
     try:
-        with open(path, "r", encoding="utf-8") as fh:
-            payload = json.load(fh)
-    except json.JSONDecodeError as exc:
-        err(f"Invalid JSON: {exc}")
-        sys.exit(1)
-
-    schema = payload.get("schema", "")
-    if not schema.startswith("evm-unsigned-tx"):
-        warn(f"Unexpected schema '{schema}' — proceeding with caution.")
-
-    status = payload.get("status", "unknown")
-    if status == "signed":
-        err("This file is already SIGNED. Nothing to do.")
-        sys.exit(1)
-
-    tx_raw = payload.get("tx", payload)
-    return payload, tx_raw
+        key_bytes = bytes.fromhex(stripped)
+    except ValueError as exc:
+        raise ValueError("Private key is not valid hex.") from exc
+    if len(key_bytes) != 32:
+        raise ValueError(f"Invalid private key — expected 32 bytes, got {len(key_bytes)}.")
+    return key_bytes
 
 
-def extract_core_tx(tx_raw: dict) -> dict:
+def resolve_private_key(chain_key: str, cli_key: str | None = None) -> bytes:
     """
-    Strip metadata blocks and return only the EVM-consensus fields
-    that eth_account.sign_transaction() expects.
+    Resolve private key in priority order:
+    1. Explicit CLI argument (`--key`)
+    2. Environment variable (`<CHAIN>_PRIVATE_KEY` / `PRIVATE_KEY`)
+    3. `DEFAULT_PRIVATE_KEYS[chain_key]` entry
+    4. `DEFAULT_PRIVATE_KEYS["default"]` fallback
+    5. Interactive getpass prompt
     """
-    SKIP = {"_meta", "_hex"}
+    if cli_key:
+        return normalize_private_key(cli_key)
+
+    env_var_name = f"{chain_key.upper()}_PRIVATE_KEY"
+    key_str = (
+        os.environ.get(env_var_name)
+        or os.environ.get("PRIVATE_KEY")
+        or DEFAULT_PRIVATE_KEYS.get(chain_key, "")
+        or DEFAULT_PRIVATE_KEYS.get("default", "")
+    )
+
+    if key_str:
+        try:
+            return normalize_private_key(key_str)
+        except ValueError:
+            pass
+
+    print(f"No default private key set for '{chain_key}'.")
+    raw = getpass("Enter private key (hidden input): ")
+    return normalize_private_key(raw)
+
+
+# ---------------------------------------------------------------------------
+# EVM Transaction Signing
+# ---------------------------------------------------------------------------
+
+def extract_core_evm_tx(tx_raw: dict) -> dict:
+    """Extract standard EVM consensus fields from transaction dict."""
+    SKIP = {"_meta", "_hex", "chain_family", "chain_key"}
     INT_FIELDS = {
-        "chainId", "nonce", "value", "gas",
+        "chainId", "nonce", "value", "gas", "gasLimit",
         "gasPrice", "maxFeePerGas", "maxPriorityFeePerGas",
     }
     tx: dict[str, Any] = {}
@@ -175,267 +120,229 @@ def extract_core_tx(tx_raw: dict) -> dict:
             continue
         if key in INT_FIELDS:
             tx[key] = int(value)
-        elif key == "data" and isinstance(value, str):
-            tx[key] = bytes.fromhex(value[2:]) if value.startswith("0x") else bytes.fromhex(value)
+        elif key == "data":
+            if isinstance(value, str):
+                tx[key] = bytes.fromhex(value[2:]) if value.startswith("0x") else bytes.fromhex(value)
+            elif isinstance(value, bytes):
+                tx[key] = value
         else:
             tx[key] = value
+
+    if "gasLimit" in tx and "gas" not in tx:
+        tx["gas"] = tx.pop("gasLimit")
+
+    # Remove 'type' field if it is 0/legacy, as eth_account expects type to be omitted for legacy transactions
+    if tx.get("type") in (0, "0", "0x0", "0x", None):
+        tx.pop("type", None)
+
     return tx
 
 
-# ---------------------------------------------------------------------------
-# Display TX for human review
-# ---------------------------------------------------------------------------
-
-CHAIN_NAMES = {
-    1:     "Ethereum Mainnet",
-    56:    "BNB Smart Chain",
-    137:   "Polygon Mainnet",
-    42161: "Arbitrum One",
-    10:    "Optimism Mainnet",
-    8453:  "Base Mainnet",
-    43114: "Avalanche C-Chain",
-}
-
-
-def wei_to_eth(wei: int) -> str:
-    return f"{Decimal(wei) / Decimal(10**18):.10f}"
-
-
-def wei_to_gwei(wei: int) -> str:
-    return f"{Decimal(wei) / Decimal(10**9):.4f}"
-
-
-def display_tx(payload: dict, tx_raw: dict) -> None:
-    """Print every TX field for careful human review."""
-    meta   = tx_raw.get("_meta", {})
-    gas_r  = meta.get("gas_readable", {})
-    tx     = extract_core_tx(tx_raw)
-
-    chain_id   = tx.get("chainId", "?")
-    chain_name = CHAIN_NAMES.get(chain_id, f"Unknown (chain_id={chain_id})")
-    tx_type    = tx.get("type", 0)
-
-    header("Transaction Details — Review Carefully")
-    sep()
-
-    # Source metadata
-    field("File created",    payload.get("created_at", "unknown"))
-    field("Schema",          payload.get("schema", "unknown"))
-    field("Status",          payload.get("status", "unknown"))
-    print()
-
-    # Chain
-    field("Chain",           f"{chain_name}  (ID: {chain_id})", alert=True)
-    field("TX Type",         meta.get("tx_type", "unknown"), alert=True)
-    field("From",            meta.get("from", tx_raw.get("from", "NOT SET")), alert=True)
-    field("To",              tx.get("to", "NOT SET"), alert=True)
-    print()
-
-    # Value
-    value_wei = tx.get("value", 0)
-    field("Value (ETH)",     f"{wei_to_eth(value_wei)} ETH", alert=(value_wei > 0))
-    field("Value (wei)",     str(value_wei))
-    print()
-
-    # Nonce & gas
-    field("Nonce",           str(tx.get("nonce", "?")))
-    field("Gas Limit",       str(tx.get("gas", "?")))
-
-    if tx_type == 2:
-        mfpg = tx.get("maxFeePerGas", 0)
-        mpfpg = tx.get("maxPriorityFeePerGas", 0)
-        field("maxFeePerGas",      f"{wei_to_gwei(mfpg)} Gwei  ({mfpg} wei)")
-        field("maxPriorityFeePerGas", f"{wei_to_gwei(mpfpg)} Gwei  ({mpfpg} wei)")
-    else:
-        gp = tx.get("gasPrice", 0)
-        field("gasPrice",    f"{wei_to_gwei(gp)} Gwei  ({gp} wei)")
-
-    print()
-
-    # Calldata
-    data = tx_raw.get("data", "0x")
-    data_str = data if isinstance(data, str) else ("0x" + data.hex() if isinstance(data, bytes) else str(data))
-    preview = data_str[:90] + ("…" if len(data_str) > 90 else "")
-    field("Data",            preview, alert=(len(data_str) > 2))
-    field("Data length",     f"{(len(data_str) - 2) // 2} bytes")
-
-    sep()
-
-    # Warnings
-    if value_wei > 0:
-        warn(f"This TX sends {wei_to_eth(value_wei)} ETH — confirm the recipient address above!")
-    if len(data_str) > 2:
-        warn("This TX includes calldata — verify you trust the contract.")
-    if meta.get("from", ""):
-        info("Signing address derived from private key must match 'From' above.")
-    print()
-
-
-# ---------------------------------------------------------------------------
-# Private key input & validation
-# ---------------------------------------------------------------------------
-
-def normalize_private_key(raw: str) -> bytes:
-    """Normalize a private-key input string into 32 raw bytes."""
-    if not raw:
-        raise ValueError("Private key is empty.")
-
-    stripped = raw[2:] if raw.startswith(("0x", "0X")) else raw
-    if not re.fullmatch(r"[0-9a-fA-F]+", stripped):
-        raise ValueError("Private key must contain only hexadecimal characters.")
-
-    try:
-        key_bytes = bytes.fromhex(stripped)
-    except ValueError as exc:
-        raise ValueError("Private key is not valid hex.") from exc
-
-    if len(key_bytes) != 32:
-        raise ValueError(f"Invalid private key — expected 32 bytes, got {len(key_bytes)}.")
-
-    return key_bytes
-
-
-def prompt_private_key() -> bytes:
-    """
-    Securely prompt for a private key. Returns the raw 32 bytes.
-    The entered string is scrubbed from Python objects as soon as possible.
-    """
-    print(_c("  Enter your private key (input is hidden):", Fore.YELLOW, bold=True))
-    print(_c("  Tip: prefix 0x is optional.", Fore.WHITE + Style.DIM))
-    print()
-
-    raw = getpass("  Private key: ")
-
-    try:
-        key_bytes = normalize_private_key(raw)
-    except ValueError as exc:
-        err(str(exc))
-        _scrub_str(raw)
-        sys.exit(1)
-
-    _scrub_str(raw)
-    return key_bytes
-
-
-def _scrub_str(s: str) -> None:
-    """
-    Best-effort overwrite of a string's internal buffer.
-    Python strings are immutable so this is not cryptographically guaranteed,
-    but it limits how long key material lingers in memory.
-    """
-    try:
-        # Access the internal char buffer via ctypes and zero it
-        buf_size = len(s) * 2 + 1  # UCS-2 / UTF-16 approx
-        offset = sys.getsizeof(s) - buf_size
-        ctypes.memset(id(s) + offset, 0, buf_size)
-    except Exception:
-        pass  # Non-fatal — best effort only
-
-
-# ---------------------------------------------------------------------------
-# Derive address & confirm
-# ---------------------------------------------------------------------------
-
-def derive_address(key_bytes: bytes) -> Any:
-    """Derive eth_account LocalAccount from raw key bytes."""
+def sign_evm_tx(tx_raw: dict, key_bytes: bytes) -> tuple[str, str, str]:
+    """Sign EVM transaction and return (signed_raw_hex, tx_hash, derived_address)."""
     if Account is None:
-        raise RuntimeError("eth-account is not installed. Install dependencies from the USB wheelhouse first.")
-
+        raise RuntimeError("eth_account is required for EVM transaction signing.")
+    tx = extract_core_evm_tx(tx_raw)
     hex_key = "0x" + key_bytes.hex()
     account = Account.from_key(hex_key)
-    return account
-
-
-def confirm_signing_address(account: LocalAccount, expected_from: str) -> bool:
-    """
-    Show the derived address and ask the user to confirm it matches
-    the 'from' address in the TX before signing.
-    """
-    header("Signing Address Verification")
-    sep()
-    field("Derived address", account.address, alert=True)
-    field("TX 'from' field", expected_from or "(not set)", alert=True)
-    sep()
-
-    if expected_from and account.address.lower() != expected_from.lower():
-        err("ADDRESS MISMATCH — the private key does not match the TX 'from' address!")
-        err("Signing would produce an invalid signature. Aborting.")
-        return False
-
-    ok("Address verified — private key matches TX 'from' field.")
-    print()
-    raw = input(_c("  Confirm and SIGN this transaction? [yes/NO]: ", Fore.YELLOW, bold=True)).strip().lower()
-    return raw in ("yes", "y")
-
-
-# ---------------------------------------------------------------------------
-# Sign transaction
-# ---------------------------------------------------------------------------
-
-def sign_transaction(tx_raw: dict, key_bytes: bytes) -> tuple[str, str]:
-    """
-    Sign the transaction and return (signed_raw_hex, tx_hash_hex).
-    The key_bytes buffer is zeroed immediately after use.
-    """
-    if Account is None:
-        raise RuntimeError("eth-account is not installed. Install dependencies from the USB wheelhouse first.")
-
-    tx = extract_core_tx(tx_raw)
-    hex_key = "0x" + key_bytes.hex()
-
-    try:
-        signed = Account.sign_transaction(tx, private_key=hex_key)
-    finally:
-        # Zero the hex key string (best effort)
-        _scrub_str(hex_key)
-        # Zero the key bytes
-        for i in range(len(key_bytes)):
-            key_bytes = key_bytes[:i] + b'\x00' + key_bytes[i+1:]
-
-    raw_tx  = signed.raw_transaction.hex()
+    signed = Account.sign_transaction(tx, private_key=hex_key)
+    raw_tx = signed.raw_transaction.hex()
     tx_hash = signed.hash.hex()
-
     if not raw_tx.startswith("0x"):
         raw_tx = "0x" + raw_tx
     if not tx_hash.startswith("0x"):
         tx_hash = "0x" + tx_hash
-
-    return raw_tx, tx_hash
+    return raw_tx, tx_hash, account.address
 
 
 # ---------------------------------------------------------------------------
-# Export signed TX
+# Dogecoin UTXO Transaction Signing
 # ---------------------------------------------------------------------------
+
+B58_ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
+SECP256K1_ORDER = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141
+
+
+def b58encode(v: bytes) -> str:
+    num = int.from_bytes(v, "big")
+    res = ""
+    while num > 0:
+        num, mod = divmod(num, 58)
+        res = B58_ALPHABET[mod] + res
+    pad = len(v) - len(v.lstrip(b"\x00"))
+    return B58_ALPHABET[0] * pad + res
+
+
+def b58check_encode(v: bytes) -> str:
+    digest = hashlib.sha256(hashlib.sha256(v).digest()).digest()[:4]
+    return b58encode(v + digest)
+
+
+def b58decode(s: str) -> bytes:
+    num = 0
+    for char in s:
+        num = num * 58 + B58_ALPHABET.index(char)
+    combined = num.to_bytes((num.bit_length() + 7) // 8 or 1, byteorder="big")
+    pad = len(s) - len(s.lstrip(B58_ALPHABET[0]))
+    return b"\x00" * pad + combined
+
+
+def b58check_decode(s: str) -> bytes:
+    raw = b58decode(s)
+    data, checksum = raw[:-4], raw[-4:]
+    if hashlib.sha256(hashlib.sha256(data).digest()).digest()[:4] != checksum:
+        raise ValueError("Invalid Base58Check checksum.")
+    return data
+
+
+def doge_address_from_key(key_bytes: bytes) -> tuple[str, bytes]:
+    if eth_keys is None:
+        raise RuntimeError("eth_keys is required for Dogecoin key operations.")
+    pk = eth_keys.PrivateKey(key_bytes)
+    pub_point = pk.public_key
+    x = pub_point.to_bytes()[:32]
+    y = int.from_bytes(pub_point.to_bytes()[32:], "big")
+    prefix = b"\x02" if y % 2 == 0 else b"\x03"
+    compressed_pubkey = prefix + x
+    pubkey_hash = hashlib.new("ripemd160", hashlib.sha256(compressed_pubkey).digest()).digest()
+    address = b58check_encode(b"\x1e" + pubkey_hash)
+    return address, compressed_pubkey
+
+
+def varint(n: int) -> bytes:
+    if n < 0xfd:
+        return bytes([n])
+    elif n <= 0xffff:
+        return b"\xfd" + struct.pack("<H", n)
+    elif n <= 0xffffffff:
+        return b"\xfe" + struct.pack("<I", n)
+    else:
+        return b"\xff" + struct.pack("<Q", n)
+
+
+def der_encode_sig(r: int, s: int) -> bytes:
+    if s > SECP256K1_ORDER // 2:
+        s = SECP256K1_ORDER - s
+    rb = r.to_bytes((r.bit_length() + 7) // 8, "big")
+    if rb[0] >= 0x80:
+        rb = b"\x00" + rb
+    sb = s.to_bytes((s.bit_length() + 7) // 8, "big")
+    if sb[0] >= 0x80:
+        sb = b"\x00" + sb
+    body = b"\x02" + bytes([len(rb)]) + rb + b"\x02" + bytes([len(sb)]) + sb
+    return b"\x30" + bytes([len(body)]) + body + b"\x01"
+
+
+def sign_doge_tx(tx_raw: dict, key_bytes: bytes) -> tuple[str, str, str]:
+    """Sign Dogecoin P2PKH UTXO transaction and return (signed_raw_hex, tx_hash, derived_address)."""
+    sender_addr, compressed_pub = doge_address_from_key(key_bytes)
+    inputs = tx_raw.get("inputs", [])
+    outputs = tx_raw.get("outputs", [])
+    if not inputs or not outputs:
+        raise ValueError("Dogecoin transaction must specify inputs and outputs.")
+
+    outs_bin = b""
+    for out in outputs:
+        val = int(out["value_satoshis"])
+        dest_addr = out["address"]
+        dest_hash = b58check_decode(dest_addr)[1:21]
+        script_pub = b"\x76\xa9\x14" + dest_hash + b"\x88\xac"
+        outs_bin += struct.pack("<Q", val) + varint(len(script_pub)) + script_pub
+
+    script_sigs = []
+    pk = eth_keys.PrivateKey(key_bytes)
+
+    for i, _inp in enumerate(inputs):
+        inp_hash = b58check_decode(sender_addr)[1:21]
+        inp_script_pub = b"\x76\xa9\x14" + inp_hash + b"\x88\xac"
+
+        preimage = struct.pack("<I", 1) + varint(len(inputs))
+        for j, in_j in enumerate(inputs):
+            txid_j = bytes.fromhex(in_j["txid"])[::-1]
+            vout_j = int(in_j["vout"])
+            preimage += txid_j + struct.pack("<I", vout_j)
+            if j == i:
+                preimage += varint(len(inp_script_pub)) + inp_script_pub
+            else:
+                preimage += b"\x00"
+            preimage += struct.pack("<I", 0xffffffff)
+
+        preimage += varint(len(outputs)) + outs_bin
+        preimage += struct.pack("<I", 0)
+        preimage += struct.pack("<I", 1)
+
+        sighash = hashlib.sha256(hashlib.sha256(preimage).digest()).digest()
+        sig = pk.sign_msg_hash(sighash)
+        der_sig = der_encode_sig(sig.r, sig.s)
+        script_sig = varint(len(der_sig)) + der_sig + varint(len(compressed_pub)) + compressed_pub
+        script_sigs.append(script_sig)
+
+    final_tx = struct.pack("<I", 1) + varint(len(inputs))
+    for i, inp in enumerate(inputs):
+        prev_txid = bytes.fromhex(inp["txid"])[::-1]
+        prev_vout = int(inp["vout"])
+        final_tx += prev_txid + struct.pack("<I", prev_vout)
+        final_tx += varint(len(script_sigs[i])) + script_sigs[i]
+        final_tx += struct.pack("<I", 0xffffffff)
+    final_tx += varint(len(outputs)) + outs_bin
+    final_tx += struct.pack("<I", 0)
+
+    signed_raw_hex = final_tx.hex()
+    tx_hash = hashlib.sha256(hashlib.sha256(final_tx).digest()).digest()[::-1].hex()
+    return signed_raw_hex, tx_hash, sender_addr
+
+
+# ---------------------------------------------------------------------------
+# High-Level Transaction Signing & Export
+# ---------------------------------------------------------------------------
+
+def sign_payload(unsigned_payload: dict, key_bytes: bytes) -> tuple[str, str, str, str]:
+    """
+    Detect chain and sign payload.
+    Returns (signed_raw_hex, tx_hash, derived_address, chain_key).
+    """
+    tx_raw = unsigned_payload.get("tx", unsigned_payload)
+    meta = tx_raw.get("_meta", {})
+    chain_family = meta.get("chain_family") or tx_raw.get("chain_family") or meta.get("family") or "evm"
+    chain_key = meta.get("chain_key") or tx_raw.get("chain_key") or "ethereum"
+
+    if chain_family == "dogecoin" or chain_key == "dogecoin":
+        signed_raw, tx_hash, address = sign_doge_tx(tx_raw, key_bytes)
+    else:
+        signed_raw, tx_hash, address = sign_evm_tx(tx_raw, key_bytes)
+
+    return signed_raw, tx_hash, address, chain_key
+
 
 def export_signed_tx(
     signed_raw_tx: str,
-    tx_hash:       str,
+    tx_hash: str,
+    from_address: str,
     original_payload: dict,
-    output_path:   str,
+    output_path: str | Path,
 ) -> Path:
-    """
-    Write the signed TX JSON file.
-
-    The output format is compatible with export.py's import_signed_tx()
-    on the online machine.
-    """
+    """Export signed transaction payload to JSON file."""
     path = Path(output_path).expanduser().resolve()
     path.parent.mkdir(parents=True, exist_ok=True)
 
-    meta = original_payload.get("tx", {}).get("_meta", {})
+    tx_block = original_payload.get("tx", original_payload)
+    meta = tx_block.get("_meta", {})
+    chain_key = meta.get("chain_key") or tx_block.get("chain_key") or "ethereum"
+    chain_name = meta.get("chain") or chain_key.title()
+    tx_type = meta.get("tx_type") or "transfer"
+    to_address = meta.get("to") or tx_block.get("to") or "unknown"
 
     signed_payload = {
-        "schema":       SIGNED_SCHEMA,
-        "created_at":   datetime.now(timezone.utc).isoformat(),
-        "status":       "signed",
-        "chain":        meta.get("chain", "unknown"),
-        "chain_key":    meta.get("chain_key", "unknown"),
-        "tx_type":      meta.get("tx_type", "unknown"),
-        "from":         meta.get("from", "unknown"),
-        "to":           original_payload.get("tx", {}).get("to", "unknown"),
-        "tx_hash":      tx_hash,
+        "schema": "crypto-signed-tx/v1",
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "status": "signed",
+        "chain": chain_name,
+        "chain_key": chain_key,
+        "tx_type": tx_type,
+        "from": from_address,
+        "to": to_address,
+        "tx_hash": tx_hash,
         "signed_raw_tx": signed_raw_tx,
-        # Keep original unsigned TX for audit trail
         "original_unsigned_tx": original_payload,
     }
 
@@ -446,105 +353,70 @@ def export_signed_tx(
 
 
 # ---------------------------------------------------------------------------
-# Main
+# CLI Entry Point
 # ---------------------------------------------------------------------------
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
-        description="Offline EVM Transaction Signer — air-gap ready, no network required.",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-Examples:
-  python signer.py unsigned_tx.json
-  python signer.py unsigned_tx.json -o signed_tx.json
-  python signer.py unsigned_tx.json --inspect-only
-        """,
+        description="Offline Transaction Signer (EVM + Dogecoin) — Air-Gap Ready.",
     )
-    p.add_argument(
-        "input",
-        help="Path to the unsigned TX JSON file (from the online machine).",
-    )
-    p.add_argument(
-        "-o", "--output",
-        default=None,
-        help="Output path for signed TX JSON. Default: signed_<input_filename>",
-    )
-    p.add_argument(
-        "--inspect-only",
-        action="store_true",
-        help="Display TX details and exit without signing.",
-    )
+    p.add_argument("input", help="Path to the unsigned TX JSON file.")
+    p.add_argument("-o", "--output", help="Output path for signed TX JSON.")
+    p.add_argument("-k", "--key", help="Private key (hex). Overrides default/env keys.")
+    p.add_argument("-y", "--yes", action="store_true", help="Auto-confirm without prompting.")
+    p.add_argument("--inspect-only", action="store_true", help="Display TX details and exit.")
     return p.parse_args()
 
 
 def main() -> None:
-    args  = parse_args()
-    banner()
+    args = parse_args()
+    input_path = Path(args.input).expanduser().resolve()
+    if not input_path.exists():
+        print(f"Error: File not found: {input_path}")
+        sys.exit(1)
 
-    # ── Step 1: Load ──────────────────────────────────────────────────────
-    info(f"Loading: {args.input}")
-    payload, tx_raw = load_unsigned_tx(args.input)
-    ok("File loaded and validated.")
+    with open(input_path, "r", encoding="utf-8") as fh:
+        payload = json.load(fh)
 
-    # ── Step 2: Display TX ────────────────────────────────────────────────
-    display_tx(payload, tx_raw)
+    tx_raw = payload.get("tx", payload)
+    meta = tx_raw.get("_meta", {})
+    chain_key = meta.get("chain_key") or tx_raw.get("chain_key") or "ethereum"
+
+    print("=" * 60)
+    print(f"  OFFLINE SIGNER — Chain: {chain_key.upper()}")
+    print("=" * 60)
+    print(f"Input file : {input_path.name}")
+    print(f"Target chain: {meta.get('chain', chain_key)}")
+    print(f"From address: {meta.get('from', tx_raw.get('from', 'NOT SET'))}")
+    print(f"To address  : {meta.get('to', tx_raw.get('to', 'NOT SET'))}")
 
     if args.inspect_only:
-        info("--inspect-only mode: exiting without signing.")
+        print("\n[--inspect-only mode] Exiting without signing.")
         sys.exit(0)
 
-    # ── Step 3: Private key input ─────────────────────────────────────────
-    header("Private Key Input")
-    sep()
-    warn("Your private key is NEVER written to disk or transmitted.")
-    warn("Ensure no screen-recording or key-logging software is running.")
-    print()
-    key_bytes = prompt_private_key()
+    key_bytes = resolve_private_key(chain_key, args.key)
+    signed_raw, tx_hash, derived_addr, resolved_chain = sign_payload(payload, key_bytes)
 
-    # ── Step 4: Derive address & confirm ──────────────────────────────────
-    account      = derive_address(key_bytes)
-    expected_from = tx_raw.get("_meta", {}).get("from", tx_raw.get("from", ""))
+    expected_from = meta.get("from") or tx_raw.get("from")
+    if expected_from and expected_from.lower() != derived_addr.lower():
+        print(f"Warning: Derived signing address {derived_addr} does not match unsigned TX 'from': {expected_from}")
 
-    if not confirm_signing_address(account, expected_from):
-        # Scrub key bytes on abort
-        key_bytes = b'\x00' * len(key_bytes)
-        err("Signing aborted by user.")
-        sys.exit(1)
+    if not args.yes:
+        confirm = input(f"\nSign transaction with derived address {derived_addr}? [Y/n]: ").strip().lower()
+        if confirm and confirm not in ("y", "yes"):
+            print("Signing cancelled.")
+            sys.exit(0)
 
-    # ── Step 5: Sign ──────────────────────────────────────────────────────
-    header("Signing")
-    sep()
-    info("Signing transaction…")
-
-    try:
-        signed_raw, tx_hash = sign_transaction(tx_raw, bytearray(key_bytes))
-    except Exception as exc:
-        err(f"Signing failed: {exc}")
-        sys.exit(1)
-
-    ok("Transaction signed successfully.")
-    print()
-    field("TX Hash",        tx_hash)
-    field("Signed TX size", f"{(len(signed_raw) - 2) // 2} bytes")
-
-    # ── Step 6: Export ────────────────────────────────────────────────────
-    input_path = Path(args.input)
-    output_path = args.output or str(input_path.parent / f"signed_{input_path.name}")
-
-    export_path = export_signed_tx(signed_raw, tx_hash, payload, output_path)
-    print()
-    sep()
-    ok(f"Signed TX written to: {export_path}")
-    info("Transfer this file to your ONLINE machine and broadcast with:")
-    print(_c(f"    python main.py  → option 8 (Broadcast a signed TX)", Fore.WHITE))
-    sep()
-    print()
+    out_file = args.output or f"signed_{input_path.name}"
+    export_path = export_signed_tx(signed_raw, tx_hash, derived_addr, payload, out_file)
+    print("\n✔ Transaction signed successfully!")
+    print(f"TX Hash    : {tx_hash}")
+    print(f"Signed file: {export_path}")
 
 
 if __name__ == "__main__":
     try:
         main()
     except KeyboardInterrupt:
-        print()
-        warn("Interrupted — no file was written.")
+        print("\nInterrupted.")
         sys.exit(0)
