@@ -73,23 +73,97 @@ def load_key_config(path: Path | None = None) -> dict[str, str]:
     return {k: str(v) for k, v in data.items() if isinstance(k, str) and v is not None}
 
 # ---------------------------------------------------------------------------
+# Base58 / Base58Check (shared by WIF parsing and Dogecoin address ops)
+# ---------------------------------------------------------------------------
+
+B58_ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
+SECP256K1_ORDER = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141
+
+
+def b58encode(v: bytes) -> str:
+    num = int.from_bytes(v, "big")
+    res = ""
+    while num > 0:
+        num, mod = divmod(num, 58)
+        res = B58_ALPHABET[mod] + res
+    pad = len(v) - len(v.lstrip(b"\x00"))
+    return B58_ALPHABET[0] * pad + res
+
+
+def b58check_encode(v: bytes) -> str:
+    digest = hashlib.sha256(hashlib.sha256(v).digest()).digest()[:4]
+    return b58encode(v + digest)
+
+
+def b58decode(s: str) -> bytes:
+    num = 0
+    for char in s:
+        num = num * 58 + B58_ALPHABET.index(char)
+    combined = num.to_bytes((num.bit_length() + 7) // 8 or 1, byteorder="big")
+    pad = len(s) - len(s.lstrip(B58_ALPHABET[0]))
+    return b"\x00" * pad + combined
+
+
+def b58check_decode(s: str) -> bytes:
+    raw = b58decode(s)
+    data, checksum = raw[:-4], raw[-4:]
+    if hashlib.sha256(hashlib.sha256(data).digest()).digest()[:4] != checksum:
+        raise ValueError("Invalid Base58Check checksum.")
+    return data
+
+
+# ---------------------------------------------------------------------------
 # Key Normalization & Resolution
 # ---------------------------------------------------------------------------
 
-def normalize_private_key(raw: str) -> bytes:
-    """Normalize a private key hex string into 32 raw bytes."""
+def parse_wif_private_key(wif: str) -> bytes:
+    """Parse a WIF (Base58Check) private key and return 32 raw bytes.
+
+    This accepts both compressed and uncompressed WIF payloads and returns
+    the underlying 32-byte private key. It does not enforce the version
+    prefix so keys from Bitcoin/Dogecoin variants are tolerated.
+    """
+    if not wif:
+        raise ValueError("WIF private key is empty.")
+    try:
+        data = b58check_decode(wif)
+    except Exception as exc:
+        raise ValueError("Invalid WIF/Base58Check private key.") from exc
+
+    # WIF payloads are: [version(1)] + privkey(32) [+ 0x01 if compressed]
+    if len(data) == 33:
+        return data[1:33]
+    if len(data) == 34 and data[-1] == 0x01:
+        return data[1:33]
+    raise ValueError("WIF payload not a valid private key length.")
+
+
+def normalize_private_key(raw: str, allow_wif: bool = False) -> bytes:
+    """Normalize a private key into 32 raw bytes.
+
+    By default this expects a hex-encoded key (optionally 0x-prefixed).
+    When `allow_wif` is True the function will also attempt to parse
+    Base58Check WIF-encoded private keys (useful for UTXO chains like Doge).
+    """
     if not raw:
         raise ValueError("Private key is empty.")
+
+    # Try hex form first (supports 0x prefix)
     stripped = raw[2:] if raw.startswith(("0x", "0X")) else raw
-    if not re.fullmatch(r"[0-9a-fA-F]+", stripped):
-        raise ValueError("Private key must contain only hexadecimal characters.")
-    try:
-        key_bytes = bytes.fromhex(stripped)
-    except ValueError as exc:
-        raise ValueError("Private key is not valid hex.") from exc
-    if len(key_bytes) != 32:
-        raise ValueError(f"Invalid private key — expected 32 bytes, got {len(key_bytes)}.")
-    return key_bytes
+    if re.fullmatch(r"[0-9a-fA-F]+", stripped):
+        try:
+            key_bytes = bytes.fromhex(stripped)
+        except ValueError as exc:
+            raise ValueError("Private key is not valid hex.") from exc
+        if len(key_bytes) != 32:
+            raise ValueError(f"Invalid private key — expected 32 bytes, got {len(key_bytes)}.")
+        return key_bytes
+
+    # If hex parsing failed and WIF is allowed, try Base58Check WIF
+    if allow_wif:
+        return parse_wif_private_key(raw)
+
+    raise ValueError("Private key must contain only hexadecimal characters.")
 
 
 def resolve_private_key(chain_key: str, cli_key: str | None = None) -> bytes:
@@ -103,7 +177,7 @@ def resolve_private_key(chain_key: str, cli_key: str | None = None) -> bytes:
     6. Interactive getpass prompt
     """
     if cli_key:
-        return normalize_private_key(cli_key)
+        return normalize_private_key(cli_key, allow_wif=(chain_key.lower() == "dogecoin"))
 
     config = load_key_config()
     env_var_name = f"{chain_key.upper()}_PRIVATE_KEY"
@@ -118,13 +192,13 @@ def resolve_private_key(chain_key: str, cli_key: str | None = None) -> bytes:
 
     if key_str:
         try:
-            return normalize_private_key(key_str)
+            return normalize_private_key(key_str, allow_wif=(chain_key.lower() == "dogecoin"))
         except ValueError:
             pass
 
     print(f"No default private key set for '{chain_key}'.")
     raw = getpass("Enter private key (hidden input): ")
-    return normalize_private_key(raw)
+    return normalize_private_key(raw, allow_wif=(chain_key.lower() == "dogecoin"))
 
 
 # ---------------------------------------------------------------------------
@@ -168,7 +242,14 @@ def sign_evm_tx(tx_raw: dict, key_bytes: bytes) -> tuple[str, str, str]:
         raise RuntimeError("eth_account is required for EVM transaction signing.")
     tx = extract_core_evm_tx(tx_raw)
     hex_key = "0x" + key_bytes.hex()
-    account = Account.from_key(hex_key)
+    # Prefer `eth_keys` for address derivation when available (more deterministic
+    # across environments); fall back to `eth_account` otherwise.
+    if eth_keys is not None:
+        pk = eth_keys.PrivateKey(key_bytes)
+        derived_address = pk.public_key.to_checksum_address()
+    else:
+        account = Account.from_key(hex_key)
+        derived_address = account.address
     signed = Account.sign_transaction(tx, private_key=hex_key)
     raw_tx = signed.raw_transaction.hex()
     tx_hash = signed.hash.hex()
@@ -176,48 +257,12 @@ def sign_evm_tx(tx_raw: dict, key_bytes: bytes) -> tuple[str, str, str]:
         raw_tx = "0x" + raw_tx
     if not tx_hash.startswith("0x"):
         tx_hash = "0x" + tx_hash
-    return raw_tx, tx_hash, account.address
+    return raw_tx, tx_hash, derived_address
 
 
 # ---------------------------------------------------------------------------
 # Dogecoin UTXO Transaction Signing
 # ---------------------------------------------------------------------------
-
-B58_ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
-SECP256K1_ORDER = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141
-
-
-def b58encode(v: bytes) -> str:
-    num = int.from_bytes(v, "big")
-    res = ""
-    while num > 0:
-        num, mod = divmod(num, 58)
-        res = B58_ALPHABET[mod] + res
-    pad = len(v) - len(v.lstrip(b"\x00"))
-    return B58_ALPHABET[0] * pad + res
-
-
-def b58check_encode(v: bytes) -> str:
-    digest = hashlib.sha256(hashlib.sha256(v).digest()).digest()[:4]
-    return b58encode(v + digest)
-
-
-def b58decode(s: str) -> bytes:
-    num = 0
-    for char in s:
-        num = num * 58 + B58_ALPHABET.index(char)
-    combined = num.to_bytes((num.bit_length() + 7) // 8 or 1, byteorder="big")
-    pad = len(s) - len(s.lstrip(B58_ALPHABET[0]))
-    return b"\x00" * pad + combined
-
-
-def b58check_decode(s: str) -> bytes:
-    raw = b58decode(s)
-    data, checksum = raw[:-4], raw[-4:]
-    if hashlib.sha256(hashlib.sha256(data).digest()).digest()[:4] != checksum:
-        raise ValueError("Invalid Base58Check checksum.")
-    return data
-
 
 def doge_address_from_key(key_bytes: bytes) -> tuple[str, bytes]:
     if eth_keys is None:
@@ -259,6 +304,8 @@ def der_encode_sig(r: int, s: int) -> bytes:
 
 def sign_doge_tx(tx_raw: dict, key_bytes: bytes) -> tuple[str, str, str]:
     """Sign Dogecoin P2PKH UTXO transaction and return (signed_raw_hex, tx_hash, derived_address)."""
+    if eth_keys is None:
+        raise RuntimeError("eth_keys is required for Dogecoin transaction signing.")
     sender_addr, compressed_pub = doge_address_from_key(key_bytes)
     inputs = tx_raw.get("inputs", [])
     outputs = tx_raw.get("outputs", [])

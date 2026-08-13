@@ -12,6 +12,10 @@ assert SPEC.loader is not None
 SPEC.loader.exec_module(signer)
 
 
+TEST_EVM_ADDRESS = "0x19E7E376E7C213B7E7e7e46cc70A5dD086DAff2A"
+TEST_KEY_HEX = "0x" + "11" * 32
+
+
 class PrivateKeyParsingTests(unittest.TestCase):
     def test_normalizes_0x_prefixed_key(self) -> None:
         key = signer.normalize_private_key("0x" + "11" * 32)
@@ -24,6 +28,31 @@ class PrivateKeyParsingTests(unittest.TestCase):
     def test_rejects_wrong_length(self) -> None:
         with self.assertRaises(ValueError):
             signer.normalize_private_key("0" * 63)
+
+    def test_dogecoin_accepts_wif_key(self) -> None:
+        key_bytes = bytes.fromhex("11" * 32)
+        wif = signer.b58check_encode(b"\x9e" + key_bytes + b"\x01")
+        parsed = signer.normalize_private_key(wif, allow_wif=True)
+        self.assertEqual(parsed, key_bytes)
+
+    def test_dogecoin_accepts_uncompressed_wif_key(self) -> None:
+        key_bytes = bytes.fromhex("22" * 32)
+        wif = signer.b58check_encode(b"\x9e" + key_bytes)
+        parsed = signer.normalize_private_key(wif, allow_wif=True)
+        self.assertEqual(parsed, key_bytes)
+
+    def test_evm_rejects_wif_key(self) -> None:
+        key_bytes = bytes.fromhex("11" * 32)
+        wif = signer.b58check_encode(b"\x9e" + key_bytes + b"\x01")
+        with self.assertRaises(ValueError):
+            signer.normalize_private_key(wif, allow_wif=False)
+
+    def test_rejects_invalid_wif_checksum(self) -> None:
+        key_bytes = bytes.fromhex("11" * 32)
+        wif = signer.b58check_encode(b"\x9e" + key_bytes + b"\x01")
+        tampered = wif[:-1] + ("1" if wif[-1] != "1" else "2")
+        with self.assertRaises(ValueError):
+            signer.normalize_private_key(tampered, allow_wif=True)
 
 
 class PrivateKeyResolutionTests(unittest.TestCase):
@@ -57,6 +86,26 @@ class PrivateKeyResolutionTests(unittest.TestCase):
             if prior_private is not None:
                 os.environ["PRIVATE_KEY"] = prior_private
 
+    def test_dogecoin_wif_config_fallback(self) -> None:
+        prior_path = signer.DEFAULT_KEY_CONFIG_PATH
+        prior_doge = signer.DEFAULT_PRIVATE_KEYS.get("dogecoin", "")
+
+        key_bytes = bytes.fromhex("55" * 32)
+        wif = signer.b58check_encode(b"\x9e" + key_bytes + b"\x01")
+
+        try:
+            with tempfile.TemporaryDirectory() as tmpdir:
+                config_path = Path(tmpdir) / "offline_signer.json"
+                config_path.write_text(json.dumps({"dogecoin": wif}), encoding="utf-8")
+                signer.DEFAULT_KEY_CONFIG_PATH = config_path
+                signer.DEFAULT_PRIVATE_KEYS["dogecoin"] = ""
+
+                resolved = signer.resolve_private_key("dogecoin")
+                self.assertEqual(resolved, key_bytes)
+        finally:
+            signer.DEFAULT_KEY_CONFIG_PATH = prior_path
+            signer.DEFAULT_PRIVATE_KEYS["dogecoin"] = prior_doge
+
 
 class SigningExecutionTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -78,7 +127,7 @@ class SigningExecutionTests(unittest.TestCase):
                     "chain": "Ethereum Mainnet",
                     "chain_key": "ethereum",
                     "chain_family": "evm",
-                    "from": "0x19E7E376E7C213B7E7e7e46cc70A5dd086DAffCA",
+                    "from": TEST_EVM_ADDRESS,
                 },
             },
         }
@@ -87,7 +136,7 @@ class SigningExecutionTests(unittest.TestCase):
         self.assertTrue(raw_hex.startswith("0x"))
         self.assertTrue(tx_hash.startswith("0x"))
         self.assertEqual(chain, "ethereum")
-        self.assertEqual(addr.lower(), "0x19E7E376E7C213B7E7e7e46cc70A5dd086DAffCA".lower())
+        self.assertEqual(addr.lower(), TEST_EVM_ADDRESS.lower())
 
     def test_dogecoin_signing(self) -> None:
         sender_addr, _ = signer.doge_address_from_key(self.key_bytes)
@@ -132,7 +181,7 @@ class SigningExecutionTests(unittest.TestCase):
                 "_meta": {
                     "chain": "Ethereum Mainnet",
                     "chain_key": "ethereum",
-                    "from": "0x19E7E376E7C213B7E7e7e46cc70A5dd086DAffCA",
+                    "from": TEST_EVM_ADDRESS,
                 },
             },
         }
@@ -142,7 +191,7 @@ class SigningExecutionTests(unittest.TestCase):
             exported = signer.export_signed_tx(
                 "0x123456",
                 "0x789abc",
-                "0x19E7E376E7C213B7E7e7e46cc70A5dd086DAffCA",
+                TEST_EVM_ADDRESS,
                 unsigned_payload,
                 out_file,
             )
